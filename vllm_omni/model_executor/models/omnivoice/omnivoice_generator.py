@@ -490,9 +490,17 @@ class _OmniVoiceCUDAGraphForward:
     # (seq_len > max bucket or non-CFG batch) without unbounded GPU growth.
     _MAX_LAZY_GRAPHS: int = 16
 
-    def __init__(self, generator: OmniVoiceGenerator, capture_sizes: list[int]) -> None:
+    def __init__(
+        self,
+        generator: OmniVoiceGenerator,
+        capture_sizes: list[int],
+        capture_batch_sizes: list[int] | None = None,
+    ) -> None:
         self._gen = generator
         self._capture_sizes = sorted(capture_sizes)
+        # CFG-doubled batch dims we pre-capture for; a shape whose two_b is not
+        # here can only fall back to lazy capture.
+        self._capture_two_bs = sorted({2 * b for b in (capture_batch_sizes or [1])})
         # Pre-warmed graphs keyed by (two_b, bucket); fixed set, never evicted.
         self._graphs: dict[tuple[int, int], dict] = {}
         # Lazy-captured graphs for oversized / non-CFG shapes; capped via LRU.
@@ -596,24 +604,26 @@ class _OmniVoiceCUDAGraphForward:
         return entry
 
     def warmup(self, device: torch.device) -> None:
-        """Pre-capture graphs for all bucket sizes with B=1 (two_b=2 for CFG)."""
+        """Pre-capture graphs for every (CFG-doubled batch, bucket) pair."""
         if not torch.cuda.is_available():
             return
         logger.info(
-            "OmniVoice CUDA Graph warmup: capturing %d bucket sizes %s",
+            "OmniVoice CUDA Graph warmup: capturing %d bucket sizes %s x %d batch dims %s",
             len(self._capture_sizes),
             self._capture_sizes,
+            len(self._capture_two_bs),
+            self._capture_two_bs,
         )
-        two_b = 2
         num_cb = self._gen.config.num_audio_codebook
-        for bucket in self._capture_sizes:
-            key = (two_b, bucket)
-            dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
-            dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
-            # Capture with a float mask to match what forward() feeds at replay time,
-            # in the model dtype so replay can copy_ into it without a cast.
-            dummy_attn = torch.zeros(two_b, 1, bucket, bucket, dtype=self._gen.model_dtype, device=device)
-            self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
+        for two_b in self._capture_two_bs:
+            for bucket in self._capture_sizes:
+                key = (two_b, bucket)
+                dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
+                dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
+                # Capture with a float mask to match what forward() feeds at replay time,
+                # in the model dtype so replay can copy_ into it without a cast.
+                dummy_attn = torch.zeros(two_b, 1, bucket, bucket, dtype=self._gen.model_dtype, device=device)
+                self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
         logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
 
     def __call__(
@@ -628,7 +638,7 @@ class _OmniVoiceCUDAGraphForward:
 
         seq_len = input_ids.shape[-1]
         two_b = input_ids.shape[0]
-        bucket = self._find_bucket(seq_len) if two_b == 2 else None
+        bucket = self._find_bucket(seq_len) if two_b in self._capture_two_bs else None
 
         # Graphs are captured with (and their static buffers hold) the additive
         # float mask, so normalize here, before padding or any copy_ into them.
@@ -737,7 +747,13 @@ class OmniVoiceGenerator(nn.Module):
 
         # CUDA Graph (bucket-size pre-capture; lazy fallback for oversized shapes)
         self._cuda_graph_fwd: _OmniVoiceCUDAGraphForward | None = (
-            _OmniVoiceCUDAGraphForward(self, config.cuda_graph_capture_sizes) if config.enable_cuda_graph else None
+            _OmniVoiceCUDAGraphForward(
+                self,
+                config.cuda_graph_capture_sizes,
+                getattr(config, "cuda_graph_capture_batch_sizes", [1]),
+            )
+            if config.enable_cuda_graph
+            else None
         )
 
     @property

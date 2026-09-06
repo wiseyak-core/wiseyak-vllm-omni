@@ -54,6 +54,44 @@ def get_omnivoice_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def _omnivoice_batch_compatibility_key(shareable: bool, request_id: str) -> tuple:
+    """Request-batch isolation key.
+
+    Plain text-to-speech requests share a key and batch together. Two cases get a
+    request-unique key, which pins them to a batch of one:
+
+    * an explicit ``seed`` — the generator takes a single seed for the whole
+      batch, so a seeded request must not be co-batched or its output would stop
+      being reproducible (``tests/e2e/online_serving`` asserts byte-identical
+      audio for a repeated seed);
+    * voice cloning — the reference audio is per-request state that has not been
+      validated batched, so it fails closed rather than risking a voice leaking
+      across requests.
+    """
+    return ("omnivoice", "tts") if shareable else ("omnivoice", "exclusive", request_id)
+
+
+def get_omnivoice_pre_process_func(od_config: OmniDiffusionConfig):
+    """Tag each request with the batch-isolation key described above."""
+
+    def pre_process_func(request):
+        prompt = request.prompt
+        shareable = True
+
+        extra = getattr(request.sampling_params, "extra_args", None) or {}
+        if extra.get("seed") is not None:
+            shareable = False
+        elif isinstance(prompt, dict):
+            mm_data = prompt.get("multi_modal_data") or {}
+            if prompt.get("ref_audio") is not None or mm_data.get("audio") is not None:
+                shareable = False
+
+        request.batch_compatibility_key = _omnivoice_batch_compatibility_key(shareable, request.request_id)
+        return request
+
+    return pre_process_func
+
+
 def _combine_text(text, ref_text: str | None = None) -> str:
     # combine with reference text if not None
     if ref_text:
@@ -132,6 +170,9 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
     """
 
     support_audio_output: ClassVar[bool] = True
+    # forward() stacks every request's CFG halves into one generator call, so the
+    # 32-step unmasking loop is amortized across the batch.
+    supports_request_batch: ClassVar[bool] = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -206,19 +247,62 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         return tokens
 
     @torch.inference_mode()
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        """Generate speech audio from text, optionally with voice cloning.
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        """Generate speech audio for every request in the batch.
 
-        Accepts either a plain text prompt or a structured dict:
+        Each prompt is either plain text or a structured dict:
           {"text": "...", "ref_audio": (samples, sr), "ref_text": "...",
            "lang": "...", "instruct": "..."}
+
+        Requests are prepared independently, then their conditional and
+        unconditional halves are stacked into one ``[2*B, 8, S]`` generator call
+        so the 32-step unmasking loop runs once for the whole batch instead of
+        once per request.
         """
-        prompt = req.prompts[0] if req.prompts else ""
+        prompts = list(req.prompts) if req.prompts else [""]
+        params = list(req.sampling_params_list) if req.prompts else [None]
+
+        prepared: list[dict | None] = []
+        outputs: list[DiffusionOutput | None] = [None] * len(prompts)
+        for i, prompt in enumerate(prompts):
+            try:
+                item = self._prepare_request(prompt, params[i])
+            except torch.cuda.OutOfMemoryError:
+                # Not a per-request problem: the device is out of memory and the
+                # rest of the batch would fail the same way. Let it propagate so
+                # the worker surfaces the fault instead of reporting it as B
+                # independent bad prompts and carrying on degraded.
+                raise
+            except Exception as exc:  # keep one bad request from failing its neighbours
+                logger.exception("OmniVoice request preparation failed")
+                outputs[i] = DiffusionOutput(error=str(exc))
+                prepared.append(None)
+                continue
+            if isinstance(item, DiffusionOutput):
+                outputs[i] = item
+                prepared.append(None)
+            else:
+                prepared.append(item)
+
+        live = [(i, p) for i, p in enumerate(prepared) if p is not None]
+        if live:
+            audios = self._generate_batch([p for _, p in live])
+            for (i, _), audio in zip(live, audios, strict=True):
+                outputs[i] = DiffusionOutput(output=audio)
+
+        return [o if o is not None else DiffusionOutput(error="OmniVoice produced no output") for o in outputs]
+
+    def _prepare_request(self, prompt, sampling_params) -> dict | DiffusionOutput:
+        """Parse one prompt and build its generator inputs.
+
+        Returns a dict of per-request tensors, or a ``DiffusionOutput`` carrying
+        a user-facing error for a prompt that cannot be synthesized.
+        """
         ref_audio = None
         ref_text = None
         lang = "None"
         instruct = "None"
-        extra = req.sampling_params.extra_args or {}
+        extra = (getattr(sampling_params, "extra_args", None) or {}) if sampling_params else {}
         seed = extra.get("seed", None)
 
         voice_name = None
@@ -324,7 +408,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
                     self._speaker_cache.put(_cache_key, {"ref_audio_tokens": ref_audio_tokens.cpu()})
                     logger.debug("Speaker cache STORE for OmniVoice speaker '%s'", voice_name)
 
-        # Build conditional + unconditional batches [2, 8, max_len]
+        # Build this request's conditional and unconditional token rows. They are
+        # padded to a batch-wide length later, in _generate_batch.
         text_ids = text_tokens.unsqueeze(0).repeat(num_cb, 1)
         target_ids = torch.full((num_cb, target_len), mask_id, dtype=torch.long, device=device)
 
@@ -332,35 +417,62 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             cond_ids = torch.cat([text_ids, ref_audio_tokens, target_ids], dim=1)
         else:
             cond_ids = torch.cat([text_ids, target_ids], dim=1)
-        cond_len = cond_ids.shape[1]
-        uncond_ids = target_ids.clone()
-        uncond_len = target_len
-        max_len = max(cond_len, uncond_len)
-        if uncond_len < max_len:
-            pad = torch.full(
-                (num_cb, max_len - uncond_len),
-                mask_id,
-                dtype=torch.long,
-                device=device,
-            )
-            uncond_ids = torch.cat([uncond_ids, pad], dim=1)
 
-        batch_input_ids = torch.stack([cond_ids, uncond_ids])
+        return {
+            "cond_ids": cond_ids,
+            "uncond_ids": target_ids.clone(),
+            "cond_len": cond_ids.shape[1],
+            "uncond_len": target_len,
+            "text_len": text_len,
+            "target_len": target_len,
+            "seed": seed,
+        }
 
-        batch_audio_mask = torch.zeros(2, max_len, dtype=torch.bool, device=device)
-        batch_audio_mask[0, text_len:cond_len] = True
-        batch_audio_mask[1, :uncond_len] = True
+    def _generate_batch(self, items: list[dict]) -> list[torch.Tensor]:
+        """Run the unmasking loop once for the whole batch, then decode each request."""
+        device = self.device
+        num_cb = self.config.num_audio_codebook
+        mask_id = self.config.audio_mask_id
+        n = len(items)
 
-        batch_attn_mask = torch.zeros(2, 1, max_len, max_len, dtype=torch.bool, device=device)
-        batch_attn_mask[0, :, :cond_len, :cond_len] = True
-        batch_attn_mask[1, :, :uncond_len, :uncond_len] = True
+        # One padded length for the whole batch: the CFG halves of every request
+        # must share a sequence dim to stack.
+        max_len = max(max(it["cond_len"], it["uncond_len"]) for it in items)
 
-        # Run 32-step iterative unmasking
+        def _pad(ids: torch.Tensor) -> torch.Tensor:
+            missing = max_len - ids.shape[1]
+            if missing <= 0:
+                return ids
+            pad = torch.full((num_cb, missing), mask_id, dtype=torch.long, device=device)
+            return torch.cat([ids, pad], dim=1)
+
+        # Generator layout is [cond_0..cond_{B-1}, uncond_0..uncond_{B-1}]: it
+        # reads the unconditional half of request i at row B+i.
+        batch_input_ids = torch.stack([_pad(it["cond_ids"]) for it in items] + [_pad(it["uncond_ids"]) for it in items])
+
+        batch_audio_mask = torch.zeros(2 * n, max_len, dtype=torch.bool, device=device)
+        batch_attn_mask = torch.zeros(2 * n, 1, max_len, max_len, dtype=torch.bool, device=device)
+        for i, it in enumerate(items):
+            c_len, u_len = it["cond_len"], it["uncond_len"]
+            batch_audio_mask[i, it["text_len"] : c_len] = True
+            batch_audio_mask[n + i, :u_len] = True
+            batch_attn_mask[i, :, :c_len, :c_len] = True
+            batch_attn_mask[n + i, :, :u_len, :u_len] = True
+
+        # A batch mixes requests whose seeds differ; the generator takes a single
+        # seed, so a batched request is only bit-reproducible against another run
+        # with the same batch composition. Requests carrying an explicit seed are
+        # kept batch-1 upstream (see batch_compatibility_key) so their output
+        # stays reproducible.
+        seeds = [it["seed"] for it in items if it["seed"] is not None]
+        seed = seeds[0] if len(seeds) == 1 and n == 1 else None
+
+        target_lens = [it["target_len"] for it in items]
         tokens = self.generator(
             input_ids=batch_input_ids,
             audio_mask=batch_audio_mask,
             attention_mask=batch_attn_mask,
-            target_lens=[target_len],
+            target_lens=target_lens,
             num_step=self.num_step,
             guidance_scale=self.guidance_scale,
             t_shift=self.t_shift,
@@ -368,11 +480,12 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             position_temperature=self.position_temperature,
             class_temperature=self.class_temperature,
             seed=seed,
-        )
-        # Decode tokens to audio
-        audio = self.decoder(tokens)  # [1, 1, samples]
+        )  # [B, 8, max_target_len]
 
-        return DiffusionOutput(output=audio)
+        # Decode per request: tokens are padded to the batch's longest target, so
+        # decoding the batch whole would run the codec over another request's
+        # padding and stretch this request's audio.
+        return [self.decoder(tokens[i : i + 1, :, : target_lens[i]]) for i in range(n)]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from model directory (not from the iterator).

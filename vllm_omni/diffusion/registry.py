@@ -620,6 +620,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "BagelPipeline": "get_bagel_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
     "BooguImagePipeline": "get_boogu_image_pre_process_func",
+    "OmniVoicePipeline": "get_omnivoice_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",

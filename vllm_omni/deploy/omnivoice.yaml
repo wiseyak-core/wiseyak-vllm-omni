@@ -1,5 +1,18 @@
 # OmniVoice TTS deploy: diffusion engine single stage (dit).
 # Text → iterative unmasking → codebook tokens → DAC decode → 24kHz audio.
+#
+# dtype is float16. PR #6317 restored half-precision serving (attention masks
+# now follow OmniVoiceGenerator.model_dtype instead of being pinned to float32,
+# which had broken CUDA graph warmup) but left the shipped default at float32.
+# The fused generator hot loop is worth far more in fp16 (-39%/-35%/-28%) than
+# in fp32 (-15%/-14%/-7%), so float32 left most of that work on the table.
+#
+# Measured locally on one RTX 4090, 12-sentence Whisper-small gate:
+#   fp32 -> 2.60 req/s, RTF 0.090, median latency 0.45s, mean WER 0.0641
+#   fp16 -> 8.63 req/s, RTF 0.027, median latency 0.13s, mean WER 0.0641
+# 3.3x throughput at identical WER, identical per-utterance audio durations,
+# and unchanged RMS. Set dtype below back to "float32" if a workload turns out
+# to be numerically sensitive.
 
 async_chunk: false
 pipeline: omnivoice
@@ -10,4 +23,11 @@ stages:
     enforce_eager: true
     trust_remote_code: true
     distributed_executor_backend: "mp"
-    dtype: "float32"
+    dtype: "float16"
+    # Request-level batching. The pipeline stacks each request's CFG halves into
+    # a single generator call, so concurrent requests share the 32-step loop
+    # instead of serializing behind it. 20ms of admission wait lets a burst
+    # coalesce; keep max_num_seqs within cuda_graph_capture_batch_sizes or
+    # batched shapes fall back to lazy graph capture.
+    max_num_seqs: 4
+    request_batch_max_wait_ms: 20

@@ -89,8 +89,7 @@ def _eager(gen: _SyntheticGenerator, ids: torch.Tensor, mask: torch.Tensor, attn
     return gen._step_forward(ids, mask, attn, gen._rope_table_for(S, ids.device, torch.float32))
 
 
-def _make_inputs(seq_len: int, device: torch.device = DEVICE):
-    two_b = 2
+def _make_inputs(seq_len: int, device: torch.device = DEVICE, two_b: int = 2):
     ids = torch.randint(0, 100, (two_b, NUM_CB, seq_len), dtype=torch.long, device=device)
     mask = torch.ones(two_b, seq_len, dtype=torch.bool, device=device)
     attn = torch.ones(two_b, 1, seq_len, seq_len, dtype=torch.bool, device=device)
@@ -218,6 +217,84 @@ def test_find_bucket_returns_nearest_bucket():
 # ---------------------------------------------------------------------------
 # 6. enable_cuda_graph=False produces same tokens as enable_cuda_graph=True
 # ---------------------------------------------------------------------------
+
+
+CAPTURE_BATCH_SIZES = [1, 2, 3, 4]
+
+
+@pytest.fixture(scope="module")
+def batched_wrapper(gen):
+    """Wrapper pre-capturing several request-batch dims, as request batching uses."""
+    from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
+        _OmniVoiceCUDAGraphForward,
+    )
+
+    w = _OmniVoiceCUDAGraphForward(
+        gen,
+        capture_sizes=CAPTURE_SIZES,
+        capture_batch_sizes=CAPTURE_BATCH_SIZES,
+    )
+    w.warmup(DEVICE)
+    return w
+
+
+@pytest.mark.parametrize("batch_size", CAPTURE_BATCH_SIZES)
+def test_warmup_precaptures_every_requested_batch_dim(batched_wrapper, batch_size):
+    """Each configured B must be pre-warmed at 2*B across every bucket.
+
+    A missing (two_b, bucket) pair is not a correctness bug but a latency cliff:
+    dispatch falls to the lazy path, which keys on the exact seq_len rather than
+    a bucket, so it captures a fresh graph per distinct length on the request's
+    own critical path.
+    """
+    for bucket in CAPTURE_SIZES:
+        assert (2 * batch_size, bucket) in batched_wrapper._graphs
+
+
+@pytest.mark.parametrize("batch_size", CAPTURE_BATCH_SIZES)
+@pytest.mark.parametrize("seq_len", [33, 64])
+def test_batched_dims_match_eager(gen, batched_wrapper, batch_size, seq_len):
+    """Pre-captured batch dims must stay bit-identical to eager."""
+    ids, mask, attn = _make_inputs(seq_len, two_b=2 * batch_size)
+    with torch.no_grad():
+        eager_out = _eager(gen, ids, mask, attn)
+        graph_out = batched_wrapper(ids, mask, attn)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+def test_batched_dims_use_precaptured_graphs_not_lazy(batched_wrapper):
+    """A configured batch dim must not touch the lazy cache.
+
+    This is the regression guard for shipping a capture list that skips a batch
+    size the deploy profile's max_num_seqs can produce.
+    """
+    before = dict(batched_wrapper._lazy_graphs)
+    for batch_size in CAPTURE_BATCH_SIZES:
+        ids, mask, attn = _make_inputs(33, two_b=2 * batch_size)
+        with torch.no_grad():
+            batched_wrapper(ids, mask, attn)
+    assert dict(batched_wrapper._lazy_graphs) == before
+
+
+def test_uncaptured_batch_dim_falls_back_correctly(gen, batched_wrapper):
+    """An unconfigured batch dim still has to produce correct output, via lazy capture."""
+    two_b = 2 * (max(CAPTURE_BATCH_SIZES) + 1)
+    ids, mask, attn = _make_inputs(33, two_b=two_b)
+    with torch.no_grad():
+        eager_out = _eager(gen, ids, mask, attn)
+        graph_out = batched_wrapper(ids, mask, attn)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+    assert (two_b, 33) in batched_wrapper._lazy_graphs
+
+
+def test_default_capture_batch_sizes_is_backward_compatible(gen):
+    """Omitting capture_batch_sizes keeps the pre-batching behaviour (B=1 only)."""
+    from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
+        _OmniVoiceCUDAGraphForward,
+    )
+
+    w = _OmniVoiceCUDAGraphForward(gen, capture_sizes=CAPTURE_SIZES)
+    assert w._capture_two_bs == [2]
 
 
 def test_cuda_graph_disabled_matches_eager_generator():
