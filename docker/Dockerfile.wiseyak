@@ -1,0 +1,59 @@
+# wiseyak deployment image for OmniVoice — a full vllm-omni install on vLLM 0.28.
+#
+# This is the image wiseai-tts pulls as
+#   registry.wiseai.wiseyak.com/wiseyak-vllm-omni:<tag>
+# built, pushed and verified by deploy.sh in the out-of-repo vllm-omni-deploy/ folder.
+#
+# It lives here, in the fork, rather than in wiseai-tts, because the build context
+# is this checkout: the previous arrangement had the Dockerfile in wiseai-tts and
+# the context on an absolute host path into this repo, so the image was
+# reproducible on exactly one machine and no CI ever built it.
+#
+# It differs from docker/Dockerfile.cuda in one way only: the extra layer below
+# that stages the deploy profile at /opt/omnivoice/deploy.yaml. That copy is
+# necessary because vllm_omni/deploy/*.yaml is NOT installed into site-packages —
+# after `pip install .` the package directory has no omnivoice.yaml for
+# --deploy-config to point at. Everything above it mirrors Dockerfile.cuda, so
+# keep the two in step when rebasing onto a new upstream release.
+#
+# Base is pinned to the release this fork is rebased onto. Bump it in the same
+# commit as the rebase; a mismatch between the base's vLLM and this checkout's
+# expected APIs is what broke the previous 0.26-based overlay image.
+
+FROM vllm/vllm-openai:v0.28.0
+
+ARG COMMON_WORKDIR=/app
+WORKDIR ${COMMON_WORKDIR}
+
+RUN apt-get update && \
+    apt-get install -y git jq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
+COPY . ${COMMON_WORKDIR}/vllm-omni
+RUN cd ${COMMON_WORKDIR}/vllm-omni && \
+    uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# Deploy profile at the stable path the compose `command:` passes to
+# --deploy-config. Copied verbatim: unlike the old overlay, nothing needs
+# stripping now that the pipeline declares supports_request_batch. The greps are
+# a build-time assertion that the profile really is the optimized one — a silent
+# fallback to fp32 or to batch-1 would look like a performance regression at
+# runtime with nothing pointing at the cause.
+RUN mkdir -p /opt/omnivoice && \
+    cp ${COMMON_WORKDIR}/vllm-omni/vllm_omni/deploy/omnivoice.yaml /opt/omnivoice/deploy.yaml && \
+    grep -qE '^\s*dtype:\s*"float16"' /opt/omnivoice/deploy.yaml && \
+    grep -qE '^\s*max_num_seqs:' /opt/omnivoice/deploy.yaml && \
+    echo "deploy profile OK (float16, request batching enabled)"
+
+RUN python3 -c "\
+import vllm; \
+from vllm_omni.entrypoints.openai import serving_speech; \
+from vllm_omni.diffusion.models.omnivoice import pipeline_omnivoice as p; \
+assert p.OmniVoicePipeline.supports_request_batch, 'pipeline cannot batch'; \
+print('vllm', vllm.__version__, '- vllm-omni imports OK, request batching supported')"
+
+ENTRYPOINT []
