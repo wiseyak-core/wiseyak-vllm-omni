@@ -42,6 +42,51 @@ import torchaudio
 
 logger = init_logger(__name__)
 
+# ==============================================================================
+# Constants & Enums for OmniVoice Pipeline
+# ==============================================================================
+
+
+class OmniVoicePromptKey:
+    """Keys used in incoming prompt dictionaries and sampling parameter extras."""
+    INPUT = "input"
+    TEXT = "text"
+    PROMPT = "prompt"
+    REF_AUDIO = "ref_audio"
+    REF_TEXT = "ref_text"
+    VOICE_NAME = "voice_name"
+    VOICE_CREATED_AT = "voice_created_at"
+    LANG = "lang"
+    INSTRUCT = "instruct"
+    SPEED = "speed"
+    NUM_STEP = "num_step"
+    CFG_STRENGTH = "cfg_strength"
+    GUIDANCE_SCALE = "guidance_scale"
+    SEED = "seed"
+    MULTI_MODAL_DATA = "multi_modal_data"
+    MM_PROCESSOR_KWARGS = "mm_processor_kwargs"
+    AUDIO = "audio"
+
+
+class OmniVoiceControlToken:
+    """Special conditioning control tokens for the OmniVoice text tokenizer."""
+    DENOISE = "<|denoise|>"
+    LANG_START = "<|lang_start|>"
+    LANG_END = "<|lang_end|>"
+    INSTRUCT_START = "<|instruct_start|>"
+    INSTRUCT_END = "<|instruct_end|>"
+    TEXT_START = "<|text_start|>"
+    TEXT_END = "<|text_end|>"
+
+
+DEFAULT_FALLBACK_REF_TEXT: str = "Nice to meet you."
+DEFAULT_FALLBACK_NUM_REF_TOKENS: int = 25
+DEFAULT_FALLBACK_LANG: str = "None"
+DEFAULT_FALLBACK_INSTRUCT: str = "None"
+DEFAULT_SPEED_FACTOR: float = 1.0
+PUNCTUATION_SENTENCE_ENDERS: tuple[str, ...] = (".", "!", "?", "।", ":", ";", "…")
+
+
 
 def get_omnivoice_post_process_func(od_config: OmniDiffusionConfig):
     """Post-processing: convert audio tensor to numpy for WAV encoding."""
@@ -79,17 +124,28 @@ def get_omnivoice_pre_process_func(od_config: OmniDiffusionConfig):
         shareable = True
 
         extra = getattr(request.sampling_params, "extra_args", None) or {}
-        if extra.get("seed") is not None:
+        if extra.get(OmniVoicePromptKey.SEED) is not None or extra.get("seed") is not None:
             shareable = False
         elif isinstance(prompt, dict):
-            mm_data = prompt.get("multi_modal_data") or {}
-            if prompt.get("ref_audio") is not None or mm_data.get("audio") is not None:
+            mm_data = prompt.get(OmniVoicePromptKey.MULTI_MODAL_DATA) or {}
+            if prompt.get(OmniVoicePromptKey.REF_AUDIO) is not None or mm_data.get(OmniVoicePromptKey.AUDIO) is not None:
                 shareable = False
 
         request.batch_compatibility_key = _omnivoice_batch_compatibility_key(shareable, request.request_id)
         return request
 
     return pre_process_func
+
+
+# Auto-register pre_process_func into vLLM-Omni diffusion registry so batch-isolation
+# ("omnivoice", "exclusive", request_id) actually executes at server runtime.
+try:
+    from vllm_omni.diffusion.registry import _DIFFUSION_PRE_PROCESS_FUNCS
+
+    _DIFFUSION_PRE_PROCESS_FUNCS["OmniVoicePipeline"] = "get_omnivoice_pre_process_func"
+    _DIFFUSION_PRE_PROCESS_FUNCS["OmniVoice"] = "get_omnivoice_pre_process_func"
+except Exception:
+    pass
 
 
 def _combine_text(text, ref_text: str | None = None) -> str:
@@ -236,6 +292,40 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         target_sr = self.audio_tokenizer.config.sample_rate
         if sr != target_sr:
             audio_signal = torchaudio.functional.resample(audio_signal, sr, target_sr)
+        # Ensure mono [1, samples]
+        if audio_signal.dim() == 2 and audio_signal.shape[0] > 1:
+            audio_signal = audio_signal.mean(dim=0, keepdim=True)
+        elif audio_signal.dim() == 1:
+            audio_signal = audio_signal.unsqueeze(0)
+
+        # RMS normalization & silence removal
+        try:
+            from omnivoice.utils.audio import remove_silence
+            wav_np = audio_signal.cpu().numpy()
+            ref_rms = float(np.sqrt(np.mean(wav_np**2)))
+            if 0 < ref_rms < 0.1:
+                wav_np = wav_np * 0.1 / ref_rms
+            # Preserve at least 400ms trailing margin so tail phonemes/syllables of ref_text are not clipped
+            wav_np = remove_silence(wav_np, target_sr, mid_sil=200, lead_sil=100, trail_sil=400)
+            if wav_np.shape[-1] > 0:
+                audio_signal = torch.from_numpy(wav_np).float()
+        except Exception:
+            try:
+                wav_np = audio_signal.cpu().numpy()
+                ref_rms = float(np.sqrt(np.mean(wav_np**2)))
+                if 0 < ref_rms < 0.1:
+                    wav_np = wav_np * 0.1 / ref_rms
+                    audio_signal = torch.from_numpy(wav_np).float()
+            except Exception:
+                pass
+
+        # Clip to hop_length multiple
+        chunk_size = getattr(self.audio_tokenizer.config, "hop_length", None)
+        if chunk_size:
+            clip_size = int(audio_signal.shape[-1] % chunk_size)
+            if clip_size > 0:
+                audio_signal = audio_signal[:, :-clip_size]
+
         # Ensure mono [B, 1, samples]
         if audio_signal.dim() == 2:
             audio_signal = audio_signal.unsqueeze(1)
@@ -300,28 +390,28 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         """
         ref_audio = None
         ref_text = None
-        lang = "None"
-        instruct = "None"
+        lang = DEFAULT_FALLBACK_LANG
+        instruct = DEFAULT_FALLBACK_INSTRUCT
         extra = (getattr(sampling_params, "extra_args", None) or {}) if sampling_params else {}
-        seed = extra.get("seed", None)
+        seed = extra.get(OmniVoicePromptKey.SEED, None)
 
         voice_name = None
         if isinstance(prompt, dict):
             # Top-level keys (used by serving_speech.py /v1/audio/speech path)
-            text = prompt.get("input") or prompt.get("text") or prompt.get("prompt")
-            ref_audio = prompt.get("ref_audio")
-            ref_text = prompt.get("ref_text")
-            voice_name = prompt.get("voice_name")
-            lang = prompt.get("lang")
-            instruct = prompt.get("instruct")
+            text = prompt.get(OmniVoicePromptKey.INPUT) or prompt.get(OmniVoicePromptKey.TEXT) or prompt.get(OmniVoicePromptKey.PROMPT)
+            ref_audio = prompt.get(OmniVoicePromptKey.REF_AUDIO)
+            ref_text = prompt.get(OmniVoicePromptKey.REF_TEXT)
+            voice_name = prompt.get(OmniVoicePromptKey.VOICE_NAME)
+            lang = prompt.get(OmniVoicePromptKey.LANG)
+            instruct = prompt.get(OmniVoicePromptKey.INSTRUCT)
             # OmniTextPrompt format (used by offline Omni.generate path):
             # ref_audio comes via multi_modal_data["audio"] and the rest via
             # mm_processor_kwargs. Fall back to those when top-level keys are
             # absent so both invocation styles work.
-            mm_data = prompt.get("multi_modal_data") or {}
-            mm_kwargs = prompt.get("mm_processor_kwargs") or {}
+            mm_data = prompt.get(OmniVoicePromptKey.MULTI_MODAL_DATA) or {}
+            mm_kwargs = prompt.get(OmniVoicePromptKey.MM_PROCESSOR_KWARGS) or {}
             if ref_audio is None:
-                audio_field = mm_data.get("audio")
+                audio_field = mm_data.get(OmniVoicePromptKey.AUDIO)
                 # Standard multimodal shape allows a list of audios; OmniVoice
                 # voice cloning conditions on a single reference clip, so
                 # unwrap a length-1 list and reject multi-reference prompts up
@@ -343,16 +433,16 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
                         sr = mm_kwargs.get("sample_rate") or self.sample_rate
                         ref_audio = (audio_field, int(sr))
             if ref_text is None:
-                ref_text = mm_kwargs.get("ref_text")
+                ref_text = mm_kwargs.get(OmniVoicePromptKey.REF_TEXT)
             if lang is None:
-                lang = mm_kwargs.get("lang")
+                lang = mm_kwargs.get(OmniVoicePromptKey.LANG)
             if instruct is None:
-                instruct = mm_kwargs.get("instruct")
+                instruct = mm_kwargs.get(OmniVoicePromptKey.INSTRUCT)
 
             if not text:
                 return DiffusionOutput(error="Empty text prompt")
-            lang = lang or "None"
-            instruct = instruct or "None"
+            lang = lang or DEFAULT_FALLBACK_LANG
+            instruct = instruct or DEFAULT_FALLBACK_INSTRUCT
         else:
             text = str(prompt)
             if not text:
@@ -362,21 +452,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         num_cb = self.config.num_audio_codebook
         mask_id = self.config.audio_mask_id
 
-        # Estimate target duration
-        target_len = self.duration_estimator.estimate_duration(text, "Nice to meet you.", 25)
-        target_len = max(1, int(target_len))
-
-        # Build text prompt with control tokens
-        style_text = f"<|denoise|><|lang_start|>{lang}<|lang_end|><|instruct_start|>{instruct}<|instruct_end|>"
-        full_text = _combine_text(ref_text=ref_text, text=text)
-        wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
-        style_tokens = self.tokenizer.encode(style_text).ids
-        text_tokens = _tokenize_with_nonverbal_tags(wrapped_text, self.tokenizer)
-        encoding_ids = style_tokens + text_tokens
-        text_tokens = torch.tensor(encoding_ids, dtype=torch.long, device=device)
-        text_len = text_tokens.shape[0]
-
-        # Encode reference audio tokens if provided (with voice caching)
+        # 1. Encode reference audio tokens if provided (with voice caching) FIRST
         ref_audio_tokens = None
         if ref_audio is not None:
             if self.audio_tokenizer is None:
@@ -386,10 +462,18 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             # Check speaker cache first
             _cache_key = None
             if voice_name:
+                audio_hash = ""
+                audio_sig_val = ref_audio[0] if isinstance(ref_audio, tuple) else ref_audio
+                if audio_sig_val is not None:
+                    import hashlib
+
+                    raw_arr = audio_sig_val.cpu().numpy() if isinstance(audio_sig_val, torch.Tensor) else np.asarray(audio_sig_val)
+                    audio_hash = hashlib.sha256(raw_arr.tobytes()[:8192]).hexdigest()[:8]
+
                 _cache_key = self._speaker_cache.make_cache_key(
-                    voice_name,
+                    f"{voice_name}_{audio_hash}" if audio_hash else voice_name,
                     model_type="omnivoice",
-                    created_at=int(prompt.get("voice_created_at") or 0),
+                    created_at=int(prompt.get(OmniVoicePromptKey.VOICE_CREATED_AT) or 0) if isinstance(prompt, dict) else 0,
                 )
                 cached = self._speaker_cache.get(_cache_key)
                 if cached is not None:
@@ -407,6 +491,97 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
                 if _cache_key is not None:
                     self._speaker_cache.put(_cache_key, {"ref_audio_tokens": ref_audio_tokens.cpu()})
                     logger.debug("Speaker cache STORE for OmniVoice speaker '%s'", voice_name)
+
+        # 2. Universal dynamic target duration estimation and pacing normalization
+        speed_val = (
+            (prompt.get(OmniVoicePromptKey.SPEED) if isinstance(prompt, dict) else None)
+            or extra.get(OmniVoicePromptKey.SPEED)
+            or extra.get("speed")
+            or mm_kwargs.get(OmniVoicePromptKey.SPEED)
+            or DEFAULT_SPEED_FACTOR
+        )
+        try:
+            speed_factor = float(speed_val)
+        except (ValueError, TypeError):
+            speed_factor = DEFAULT_SPEED_FACTOR
+
+        if ref_text:
+            ref_text = str(ref_text).strip()
+            if ref_text and ref_text[-1] not in PUNCTUATION_SENTENCE_ENDERS:
+                is_devanagari = any("\u0900" <= ch <= "\u097f" for ch in ref_text)
+                ref_text = ref_text + ("।" if is_devanagari else ".")
+
+        # Natural conversational pacing bounds (audio tokens per phonetic weight unit at 24kHz/960 hop):
+        # Calibrated for natural, articulate conversational pacing (~14 - 15 characters/sec):
+        # Baseline 1.60 tokens/weight yields brisk, energetic delivery. Range [1.40, 1.85] prevents sluggishness.
+        BASELINE_TOKENS_PER_WEIGHT: float = 1.60
+        MIN_TOKENS_PER_WEIGHT: float = 1.40
+        MAX_TOKENS_PER_WEIGHT: float = 1.85
+        TAIL_DECAY_TOKENS: int = 1  # ~40ms natural acoustic decay room
+
+        target_weight = self.duration_estimator.calculate_total_weight(text)
+
+        # Estimate reference pace ratio (tokens per weight unit)
+        if ref_audio_tokens is not None and ref_text and len(str(ref_text).strip()) > 0:
+            num_ref_tokens = ref_audio_tokens.shape[-1]
+            ref_weight = self.duration_estimator.calculate_total_weight(str(ref_text).strip())
+            if ref_weight > 0 and num_ref_tokens > 0:
+                raw_ratio = num_ref_tokens / ref_weight
+                # Smoothly normalize / clamp ratio into conversational bounds
+                # If within bounds, blend gently with baseline to retain individual vocal tempo:
+                clamped_ratio = max(MIN_TOKENS_PER_WEIGHT, min(MAX_TOKENS_PER_WEIGHT, raw_ratio))
+                ratio = 0.65 * clamped_ratio + 0.35 * BASELINE_TOKENS_PER_WEIGHT
+            else:
+                ratio = BASELINE_TOKENS_PER_WEIGHT
+        else:
+            ratio = BASELINE_TOKENS_PER_WEIGHT
+
+        # Base target duration in tokens
+        target_len = int(round(target_weight * ratio)) + TAIL_DECAY_TOKENS
+
+        # Dynamic user-configured speed factor (speed > 1.0 = faster, speed < 1.0 = slower)
+        if speed_factor > 0 and speed_factor != DEFAULT_SPEED_FACTOR:
+            target_len = int(round(target_len / speed_factor))
+        target_len = max(1, target_len)
+
+        # 3. Dynamic sampling parameters (num_step & guidance_scale)
+        req_num_step = (
+            (prompt.get(OmniVoicePromptKey.NUM_STEP) if isinstance(prompt, dict) else None)
+            or extra.get(OmniVoicePromptKey.NUM_STEP)
+            or self.num_step
+        )
+        req_guidance_scale = (
+            (prompt.get(OmniVoicePromptKey.CFG_STRENGTH) if isinstance(prompt, dict) else None)
+            or (prompt.get(OmniVoicePromptKey.GUIDANCE_SCALE) if isinstance(prompt, dict) else None)
+            or extra.get(OmniVoicePromptKey.CFG_STRENGTH)
+            or extra.get(OmniVoicePromptKey.GUIDANCE_SCALE)
+            or self.guidance_scale
+        )
+        try:
+            req_num_step = int(req_num_step)
+        except (ValueError, TypeError):
+            req_num_step = self.num_step
+        try:
+            req_guidance_scale = float(req_guidance_scale)
+        except (ValueError, TypeError):
+            req_guidance_scale = self.guidance_scale
+
+        # 4. Build text prompt with control tokens
+        style_text = ""
+        if ref_audio_tokens is not None:
+            style_text += OmniVoiceControlToken.DENOISE
+        style_text += f"{OmniVoiceControlToken.LANG_START}{lang}{OmniVoiceControlToken.LANG_END}{OmniVoiceControlToken.INSTRUCT_START}{instruct}{OmniVoiceControlToken.INSTRUCT_END}"
+
+        # Guard: Only condition on ref_text if ref_audio_tokens is actually present.
+        # Without paired audio, prepending ref_text forces the model to synthesize ref_text aloud.
+        effective_ref_text = ref_text if ref_audio_tokens is not None else None
+        full_text = _combine_text(ref_text=effective_ref_text, text=text)
+        wrapped_text = f"{OmniVoiceControlToken.TEXT_START}{full_text}{OmniVoiceControlToken.TEXT_END}"
+        style_tokens = self.tokenizer.encode(style_text).ids
+        text_tokens = _tokenize_with_nonverbal_tags(wrapped_text, self.tokenizer)
+        encoding_ids = style_tokens + text_tokens
+        text_tokens = torch.tensor(encoding_ids, dtype=torch.long, device=device)
+        text_len = text_tokens.shape[0]
 
         # Build this request's conditional and unconditional token rows. They are
         # padded to a batch-wide length later, in _generate_batch.
@@ -426,6 +601,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             "text_len": text_len,
             "target_len": target_len,
             "seed": seed,
+            "num_step": req_num_step,
+            "guidance_scale": req_guidance_scale,
         }
 
     def _generate_batch(self, items: list[dict]) -> list[torch.Tensor]:
@@ -467,14 +644,17 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         seeds = [it["seed"] for it in items if it["seed"] is not None]
         seed = seeds[0] if len(seeds) == 1 and n == 1 else None
 
+        batch_num_step = items[0].get(OmniVoicePromptKey.NUM_STEP, self.num_step) if items else self.num_step
+        batch_guidance_scale = items[0].get(OmniVoicePromptKey.GUIDANCE_SCALE, self.guidance_scale) if items else self.guidance_scale
+
         target_lens = [it["target_len"] for it in items]
         tokens = self.generator(
             input_ids=batch_input_ids,
             audio_mask=batch_audio_mask,
             attention_mask=batch_attn_mask,
             target_lens=target_lens,
-            num_step=self.num_step,
-            guidance_scale=self.guidance_scale,
+            num_step=batch_num_step,
+            guidance_scale=batch_guidance_scale,
             t_shift=self.t_shift,
             layer_penalty_factor=self.layer_penalty_factor,
             position_temperature=self.position_temperature,
