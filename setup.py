@@ -149,7 +149,7 @@ def get_vllm_omni_version() -> str:
             version = get_version()
         except Exception as e:
             print(f"Warning: Failed to get version from git, using fallback: {e}")
-            version = "0.28.0.dev0"
+            version = "dev"
 
         # Determine separator: '+' for normal versions, '.' for dev versions with '+'
         sep = "+" if "+" not in version else "."
